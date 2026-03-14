@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
 WORKDIR /app
-ENV MATAROA_BOT_DIR=/app
+ENV MATAROA_BOT_DIR=/app/.state
 
 # Install dependencies
 RUN apt-get update && \
@@ -14,6 +14,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the bot code into the container
-COPY mataroa.py .
+COPY mataroa.py handlers.py constants.py storage.py ./
+
+RUN mkdir -p /app/.state && chmod 700 /app/.state
 
 CMD [ "python", "mataroa.py" ]
