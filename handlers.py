@@ -2,7 +2,9 @@
 
 import asyncio
 from datetime import datetime
+from functools import lru_cache
 import logging
+import os
 import re
 import secrets
 import time
@@ -109,7 +111,10 @@ def extract_message_text(message: Any) -> str:
     entities = getattr(message, "entities", None)
     if entities:
         for attr in ("text_markdown", "text_markdown_v2"):
-            val = getattr(message, attr, None)
+            try:
+                val = getattr(message, attr, None)
+            except Exception:
+                continue
             if isinstance(val, str) and val:
                 return val
     return text
@@ -158,8 +163,38 @@ async def schedule_users_data_save(
         await save_users_data()
 
 
+@lru_cache(maxsize=1)
+def allowed_user_ids() -> Optional[Set[int]]:
+    raw_allowed = os.getenv("MATAROA_BOT_ALLOWED_USERS", "").strip()
+    if not raw_allowed:
+        return None
+    allowed: Set[int] = set()
+    for part in raw_allowed.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            allowed.add(int(part))
+        except ValueError:
+            logger.warning("Ignoring invalid MATAROA_BOT_ALLOWED_USERS entry: %s", part)
+    return allowed
+
+
 async def ensure_allowed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    return True
+    allowed = allowed_user_ids()
+    if allowed is None:
+        return True
+    user_id = get_user_id(update)
+    if user_id in allowed:
+        return True
+    if update.callback_query:
+        try:
+            await update.callback_query.answer(MESSAGES["ACCESS_DENIED"], show_alert=True)
+        except Exception:
+            pass
+    elif update.message:
+        await update.message.reply_text(MESSAGES["ACCESS_DENIED"])
+    return False
 
 
 def slugify(title: str) -> str:
@@ -818,6 +853,22 @@ def set_draft_parts(context: ContextTypes.DEFAULT_TYPE, parts: List[str]) -> Non
     context.user_data[K_BODY_PARTS] = list(parts)
 
 
+def _clear_active_draft(
+    user_id: int, context: ContextTypes.DEFAULT_TYPE, *, clear_title: bool = True
+) -> None:
+    """Clear active in-memory and persistent draft state for a user."""
+    if clear_title:
+        context.user_data.pop(K_TITLE, None)
+    context.user_data.pop(K_BODY, None)
+    context.user_data[K_BODY_PARTS] = []
+    context.user_data[K_UNDO_STACK] = []
+    u = users_data[user_id]
+    if clear_title:
+        u.draft_title = ""
+    u.draft_parts = []
+    u.undo_stack = []
+
+
 def _drafts_map(user_id: int) -> Dict[str, Dict[str, Any]]:
     u = users_data.get(user_id)
     if u is None:
@@ -1089,8 +1140,8 @@ async def enter_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def enter_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update, context):
         return ENTER_BODY
-    text = extract_message_text(update.message).strip()
-    if not text:
+    text = extract_message_text(update.message)
+    if not text.strip():
         await update.message.reply_text(MESSAGES["PROMPT_VALID_CONTENT"], reply_markup=drafting_keyboard())
         return ENTER_BODY
     parts = get_draft_parts(context)
@@ -1157,14 +1208,13 @@ async def draft_preview_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def draft_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update, context):
         return ENTER_BODY
-    set_draft_parts(context, [])
-    context.user_data[K_UNDO_STACK] = []
-    u = users_data[update.message.from_user.id]
-    u.draft_parts = []
-    u.undo_stack = []
+    _clear_active_draft(update.message.from_user.id, context)
     await schedule_users_data_save(context)
-    await update.message.reply_text(MESSAGES["DRAFT_CLEARED"], reply_markup=drafting_keyboard())
-    return ENTER_BODY
+    await update.message.reply_text(
+        f"{MESSAGES['DRAFT_CLEARED']}\n\n{MESSAGES['ENTER_TITLE_PROMPT']}",
+        reply_markup=cancel_keyboard(),
+    )
+    return ENTER_TITLE
 
 
 async def draft_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1175,14 +1225,13 @@ async def draft_clear_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ENTER_BODY
     if not await gate_callback(query, context):
         return ENTER_BODY
-    set_draft_parts(context, [])
-    context.user_data[K_UNDO_STACK] = []
-    u = users_data[query.from_user.id]
-    u.draft_parts = []
-    u.undo_stack = []
+    _clear_active_draft(query.from_user.id, context)
     await schedule_users_data_save(context)
-    await query.edit_message_text(MESSAGES["DRAFT_CLEARED"], reply_markup=drafting_keyboard())
-    return ENTER_BODY
+    await query.edit_message_text(
+        f"{MESSAGES['DRAFT_CLEARED']}\n\n{MESSAGES['ENTER_TITLE_PROMPT']}",
+        reply_markup=cancel_keyboard(),
+    )
+    return ENTER_TITLE
 
 
 async def draft_undo_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1464,11 +1513,8 @@ async def _submit_create_post(query: Any, context: ContextTypes.DEFAULT_TYPE) ->
         slug = data.get("slug") if isinstance(data, dict) else None
         url = data.get("url") if isinstance(data, dict) else None
         # Clear draft after success
-        u = users_data[user_id]
-        u.draft_title = ""
-        u.draft_parts = []
-        u.undo_stack = []
-        u.last_action = {}
+        _clear_active_draft(user_id, context)
+        users_data[user_id].last_action = {}
         await save_users_data()
         context.user_data.pop(K_POSTS_CACHE, None)
         # Add inline buttons for immediate Edit and Delete actions.
@@ -1641,8 +1687,8 @@ async def enter_updated_title(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def enter_updated_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ensure_allowed(update, context):
         return ENTER_UPDATED_BODY
-    updated_body = extract_message_text(update.message).strip()
-    if not updated_body:
+    updated_body = extract_message_text(update.message)
+    if not updated_body.strip():
         await update.message.reply_text(MESSAGES["PROMPT_VALID_CONTENT"], reply_markup=cancel_keyboard())
         return ENTER_UPDATED_BODY
     context.user_data[K_BODY] = updated_body

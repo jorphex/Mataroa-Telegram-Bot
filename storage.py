@@ -49,6 +49,20 @@ class UserData:
     )
 
 
+def _string_list(value: Any) -> List[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
+
+
+def _string_dict(value: Any) -> Dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _valid_publish_mode(value: Any) -> str:
+    return value if value in {"draft", "publish"} else "draft"
+
+
 def _get_users_data_lock() -> asyncio.Lock:
     global _users_data_lock
     if _users_data_lock is None:
@@ -201,14 +215,18 @@ async def load_users_data() -> None:
                     api_key=str(v.get("api_key", "")),
                     title=str(v.get("title", "")),
                     body=str(v.get("body", "")),
-                    published_at=v.get("published_at", None),
+                    published_at=v.get("published_at")
+                    if isinstance(v.get("published_at"), str)
+                    else None,
                     draft_title=str(v.get("draft_title", "")),
-                    draft_parts=v.get("draft_parts", []) or [],
+                    draft_parts=_string_list(v.get("draft_parts")),
                     drafts=drafts,
-                    undo_stack=v.get("undo_stack", []) or [],
-                    last_action=v.get("last_action", {}) or {},
+                    undo_stack=_string_list(v.get("undo_stack")),
+                    last_action=_string_dict(v.get("last_action")),
                     settings={
-                        "default_publish_mode": settings.get("default_publish_mode", "draft")
+                        "default_publish_mode": _valid_publish_mode(
+                            settings.get("default_publish_mode", "draft")
+                        )
                         if isinstance(settings, dict)
                         else "draft",
                         "preview_length": preview_len,
