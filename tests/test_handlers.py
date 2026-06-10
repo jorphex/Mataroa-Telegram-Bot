@@ -3,8 +3,12 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+import handler_posts
 import handlers as h
 from constants import (
+    CB_DELETE_PREFIX,
+    CB_EDIT_PREFIX,
+    CB_TOGGLEPUB_PREFIX,
     ENTER_BODY,
     ENTER_PUBLISH_CHOICE_UPDATE,
     ENTER_TITLE,
@@ -43,6 +47,21 @@ class FakeContext:
         self.application = SimpleNamespace(user_data={})
 
 
+class FakeBot:
+    def __init__(self, *, fail_edit=False):
+        self.fail_edit = fail_edit
+        self.edits = []
+        self.sends = []
+
+    async def edit_message_text(self, **kwargs):
+        if self.fail_edit:
+            raise RuntimeError("edit failed")
+        self.edits.append(kwargs)
+
+    async def send_message(self, chat_id, **kwargs):
+        self.sends.append((chat_id, kwargs))
+
+
 class MarkdownRaisesMessage:
     text = "plain fallback"
     entities = [object()]
@@ -78,6 +97,26 @@ def test_allowed_user_ids_ignores_bad_entries_and_caches(monkeypatch):
     monkeypatch.setenv("MATAROA_BOT_ALLOWED_USERS", "3")
     assert h.allowed_user_ids() == {1, 2}
     h.allowed_user_ids.cache_clear()
+
+
+def test_build_manage_post_view_uses_tokenized_actions():
+    users_data[1] = UserData(api_key="key")
+    context = FakeContext()
+    post = {
+        "title": "Title *x*",
+        "published_at": "2026-06-09",
+        "url": "https://example.com/post",
+    }
+
+    text, markup = h.build_manage_post_view(post, "my-post", context, 1)
+
+    rows = markup.inline_keyboard
+    assert "Manage Post" in text
+    assert "Published" in text
+    assert rows[0][0].callback_data.startswith(CB_EDIT_PREFIX)
+    assert rows[0][1].callback_data.startswith(CB_DELETE_PREFIX)
+    assert rows[1][0].callback_data.startswith(CB_TOGGLEPUB_PREFIX)
+    assert rows[1][1].url == "https://example.com/post"
 
 
 @pytest.mark.asyncio
@@ -149,8 +188,8 @@ async def test_submit_create_success_clears_context_and_persistent_draft(monkeyp
             "url": "https://example.com/blog/new-post/",
         }
 
-    monkeypatch.setattr(h, "save_users_data", save_noop)
-    monkeypatch.setattr(h, "api_call", api_call_noop)
+    monkeypatch.setattr(handler_posts, "save_users_data", save_noop)
+    monkeypatch.setattr(handler_posts, "api_call", api_call_noop)
     users_data[1] = UserData(
         api_key="key",
         draft_title="Title",
@@ -177,3 +216,14 @@ async def test_submit_create_success_clears_context_and_persistent_draft(monkeyp
     assert users_data[1].draft_title == ""
     assert users_data[1].draft_parts == []
     assert users_data[1].last_action == {}
+
+
+@pytest.mark.asyncio
+async def test_notify_delete_result_falls_back_to_send_when_edit_fails():
+    bot = FakeBot(fail_edit=True)
+    context = SimpleNamespace(application=SimpleNamespace(bot=bot))
+
+    await h.notify_delete_result(context, 10, 20, "done")
+
+    assert bot.edits == []
+    assert bot.sends == [(10, {"text": "done", "reply_markup": None})]
